@@ -5,6 +5,7 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const bcrypt = require('bcryptjs');
+const jwt = require('jsonwebtoken');
 
 // Initialize express app
 const app = express();
@@ -28,7 +29,7 @@ const connectDB = async () => {
 
 connectDB();
 
-// User Schema
+// ============= USER SCHEMA =============
 const userSchema = new mongoose.Schema({
   firstName: { type: String, required: true },
   lastName: { type: String, required: true },
@@ -40,7 +41,7 @@ const userSchema = new mongoose.Schema({
   location: { type: String, required: true },
   interests: [String],
   hobbies: [String],
-  bio: { type: String, maxlength: 500 },
+  bio: { type: String, maxlength: 500, default: '' },
   profilePicture: { type: String, default: '' },
   connections: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
   posts: [{ type: mongoose.Schema.Types.ObjectId, ref: 'Post' }],
@@ -50,7 +51,25 @@ const userSchema = new mongoose.Schema({
 
 const User = mongoose.model('User', userSchema);
 
-// ============= ROUTES =============
+// ============= POST SCHEMA =============
+const postSchema = new mongoose.Schema({
+  author: { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  title: { type: String, required: true, maxlength: 200 },
+  content: { type: String, required: true, maxlength: 5000 },
+  interestTag: { type: String },
+  imageUrl: { type: String },
+  likes: [{ type: mongoose.Schema.Types.ObjectId, ref: 'User' }],
+  comments: [{
+    user: { type: mongoose.Schema.Types.ObjectId, ref: 'User' },
+    text: String,
+    createdAt: { type: Date, default: Date.now }
+  }],
+  createdAt: { type: Date, default: Date.now }
+}, { timestamps: true });
+
+const Post = mongoose.model('Post', postSchema);
+
+// ============= TEST & HEALTH ROUTES =============
 
 // Test route
 app.get('/api/test', (req, res) => {
@@ -70,6 +89,8 @@ app.get('/api/health', (req, res) => {
   });
 });
 
+// ============= AUTH ROUTES =============
+
 // Register user
 app.post('/api/auth/register', async (req, res) => {
   try {
@@ -86,7 +107,6 @@ app.post('/api/auth/register', async (req, res) => {
       hobbies 
     } = req.body;
 
-    // Validate required fields
     if (!firstName || !lastName || !email || !phone || !password || !age || !ageGroup || !location) {
       return res.status(400).json({ 
         success: false, 
@@ -94,7 +114,6 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    // Check if user already exists
     const existingUser = await User.findOne({ $or: [{ email }, { phone }] });
     if (existingUser) {
       return res.status(400).json({ 
@@ -103,10 +122,8 @@ app.post('/api/auth/register', async (req, res) => {
       });
     }
 
-    // Hash password
     const hashedPassword = await bcrypt.hash(password, 10);
 
-    // Create user
     const user = new User({
       firstName,
       lastName,
@@ -147,31 +164,35 @@ app.post('/api/auth/register', async (req, res) => {
     });
   }
 });
+
 // Login user
 app.post('/api/auth/login', async (req, res) => {
   try {
     const { email, password } = req.body;
     
-    // Find user by email
     const user = await User.findOne({ email });
     if (!user) {
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
     
-    // Check password
     const isPasswordValid = await bcrypt.compare(password, user.password);
     if (!isPasswordValid) {
       return res.status(401).json({ success: false, message: 'Invalid email or password' });
     }
     
-    // Update last active
     user.lastActive = new Date();
     await user.save();
     
-    // Return user without password
+    const token = jwt.sign(
+      { id: user._id, email: user.email },
+      process.env.JWT_SECRET || 'your-secret-key',
+      { expiresIn: '7d' }
+    );
+    
     res.json({
       success: true,
       message: 'Login successful',
+      token,
       user: {
         id: user._id,
         firstName: user.firstName,
@@ -181,7 +202,9 @@ app.post('/api/auth/login', async (req, res) => {
         ageGroup: user.ageGroup,
         location: user.location,
         interests: user.interests,
-        hobbies: user.hobbies
+        hobbies: user.hobbies,
+        bio: user.bio,
+        connections: user.connections
       }
     });
   } catch (error) {
@@ -189,7 +212,8 @@ app.post('/api/auth/login', async (req, res) => {
     res.status(500).json({ success: false, message: 'Server error. Please try again.' });
   }
 });
-// Get all users (for testing)
+
+// Get all users
 app.get('/api/auth/users', async (req, res) => {
   try {
     const users = await User.find().select('-password');
@@ -219,10 +243,32 @@ app.get('/api/auth/user/:id', async (req, res) => {
   }
 });
 
-// Search users by name or interest
+// Get current user profile (from token)
+app.get('/api/auth/me', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const user = await User.findById(decoded.id).select('-password');
+    
+    if (!user) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    
+    res.json({ success: true, user });
+  } catch (error) {
+    console.error('Auth error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Search users by name, interest, location, or ageGroup
 app.get('/api/auth/search', async (req, res) => {
   try {
-    const { q, interest, location } = req.query;
+    const { q, interest, location, ageGroup } = req.query;
     let query = {};
     
     if (q) {
@@ -241,7 +287,11 @@ app.get('/api/auth/search', async (req, res) => {
       query.location = { $regex: location, $options: 'i' };
     }
     
-    const users = await User.find(query).select('-password').limit(20);
+    if (ageGroup) {
+      query.ageGroup = ageGroup;
+    }
+    
+    const users = await User.find(query).select('-password').limit(50);
     res.json({ success: true, users });
   } catch (error) {
     res.status(500).json({ success: false, message: error.message });
@@ -255,6 +305,7 @@ app.put('/api/auth/user/:id', async (req, res) => {
     delete updates.password;
     delete updates.email;
     delete updates.phone;
+    delete updates._id;
     
     const user = await User.findByIdAndUpdate(
       req.params.id,
@@ -272,7 +323,7 @@ app.put('/api/auth/user/:id', async (req, res) => {
   }
 });
 
-// Delete user (for testing)
+// Delete user
 app.delete('/api/auth/user/:id', async (req, res) => {
   try {
     const user = await User.findByIdAndDelete(req.params.id);
@@ -285,7 +336,344 @@ app.delete('/api/auth/user/:id', async (req, res) => {
   }
 });
 
-// 404 handler for undefined routes
+// ============= CONNECTION ROUTES =============
+
+// Send connection request (Add to connections)
+app.post('/api/connections/request/:userId', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const currentUserId = decoded.id;
+    const targetUserId = req.params.userId;
+    
+    if (currentUserId === targetUserId) {
+      return res.status(400).json({ success: false, message: 'Cannot connect with yourself' });
+    }
+    
+    const currentUser = await User.findById(currentUserId);
+    const targetUser = await User.findById(targetUserId);
+    
+    if (!currentUser || !targetUser) {
+      return res.status(404).json({ success: false, message: 'User not found' });
+    }
+    
+    if (currentUser.connections.includes(targetUserId)) {
+      return res.status(400).json({ success: false, message: 'Already connected' });
+    }
+    
+    await User.findByIdAndUpdate(currentUserId, {
+      $addToSet: { connections: targetUserId }
+    });
+    
+    await User.findByIdAndUpdate(targetUserId, {
+      $addToSet: { connections: currentUserId }
+    });
+    
+    res.json({ 
+      success: true, 
+      message: 'Connected successfully!' 
+    });
+  } catch (error) {
+    console.error('Connection error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Remove connection
+app.delete('/api/connections/remove/:userId', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const currentUserId = decoded.id;
+    const targetUserId = req.params.userId;
+    
+    await User.findByIdAndUpdate(currentUserId, {
+      $pull: { connections: targetUserId }
+    });
+    
+    await User.findByIdAndUpdate(targetUserId, {
+      $pull: { connections: currentUserId }
+    });
+    
+    res.json({ 
+      success: true, 
+      message: 'Connection removed successfully' 
+    });
+  } catch (error) {
+    console.error('Remove connection error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Get user's connections
+app.get('/api/connections', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const userId = decoded.id;
+    
+    const user = await User.findById(userId).populate('connections', '-password');
+    
+    res.json({ 
+      success: true, 
+      connections: user.connections || []
+    });
+  } catch (error) {
+    console.error('Get connections error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Get connection status with a user
+app.get('/api/connections/status/:userId', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const currentUserId = decoded.id;
+    const targetUserId = req.params.userId;
+    
+    const currentUser = await User.findById(currentUserId);
+    const isConnected = currentUser?.connections?.includes(targetUserId) || false;
+    
+    res.json({ 
+      success: true, 
+      isConnected 
+    });
+  } catch (error) {
+    console.error('Connection status error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ============= POST ROUTES =============
+
+// Create a post
+app.post('/api/posts', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const userId = decoded.id;
+    
+    const { title, content, interestTag, imageUrl } = req.body;
+    
+    if (!title || !content) {
+      return res.status(400).json({ success: false, message: 'Title and content are required' });
+    }
+    
+    const post = new Post({
+      author: userId,
+      title,
+      content,
+      interestTag,
+      imageUrl
+    });
+    
+    await post.save();
+    
+    // Add post to user's posts array
+    await User.findByIdAndUpdate(userId, {
+      $push: { posts: post._id }
+    });
+    
+    // Populate author details
+    const populatedPost = await Post.findById(post._id).populate('author', 'firstName lastName profilePicture');
+    
+    res.status(201).json({
+      success: true,
+      message: 'Post created successfully',
+      post: populatedPost
+    });
+  } catch (error) {
+    console.error('Create post error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Get posts from connected people (feed)
+app.get('/api/posts/feed', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const userId = decoded.id;
+    
+    const user = await User.findById(userId);
+    const connectedUserIds = user.connections || [];
+    
+    // Get posts from connected users and the current user
+    const posts = await Post.find({ 
+      author: { $in: [...connectedUserIds, userId] } 
+    })
+    .populate('author', 'firstName lastName profilePicture')
+    .sort({ createdAt: -1 })
+    .limit(50);
+    
+    res.json({ success: true, posts });
+  } catch (error) {
+    console.error('Get feed error:', error);
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Get all posts (for testing)
+app.get('/api/posts', async (req, res) => {
+  try {
+    const posts = await Post.find()
+      .populate('author', 'firstName lastName profilePicture')
+      .sort({ createdAt: -1 });
+    res.json({ success: true, posts });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Get user's own posts
+app.get('/api/posts/my', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const userId = decoded.id;
+    
+    const posts = await Post.find({ author: userId })
+      .populate('author', 'firstName lastName profilePicture')
+      .sort({ createdAt: -1 });
+    
+    res.json({ success: true, posts });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Like a post
+app.post('/api/posts/:postId/like', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const userId = decoded.id;
+    
+    const post = await Post.findById(req.params.postId);
+    if (!post) {
+      return res.status(404).json({ success: false, message: 'Post not found' });
+    }
+    
+    const likeIndex = post.likes.indexOf(userId);
+    if (likeIndex === -1) {
+      post.likes.push(userId);
+    } else {
+      post.likes.splice(likeIndex, 1);
+    }
+    
+    await post.save();
+    
+    res.json({ success: true, likes: post.likes.length });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Add comment to post
+app.post('/api/posts/:postId/comment', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const userId = decoded.id;
+    const { text } = req.body;
+    
+    if (!text) {
+      return res.status(400).json({ success: false, message: 'Comment text is required' });
+    }
+    
+    const post = await Post.findById(req.params.postId);
+    if (!post) {
+      return res.status(404).json({ success: false, message: 'Post not found' });
+    }
+    
+    post.comments.push({
+      user: userId,
+      text
+    });
+    
+    await post.save();
+    
+    const updatedPost = await Post.findById(req.params.postId)
+      .populate('author', 'firstName lastName profilePicture')
+      .populate('comments.user', 'firstName lastName profilePicture');
+    
+    res.json({ success: true, post: updatedPost });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// Delete post
+app.delete('/api/posts/:postId', async (req, res) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (!token) {
+      return res.status(401).json({ success: false, message: 'No token provided' });
+    }
+    
+    const decoded = jwt.verify(token, process.env.JWT_SECRET || 'your-secret-key');
+    const userId = decoded.id;
+    
+    const post = await Post.findById(req.params.postId);
+    if (!post) {
+      return res.status(404).json({ success: false, message: 'Post not found' });
+    }
+    
+    if (post.author.toString() !== userId) {
+      return res.status(403).json({ success: false, message: 'Not authorized to delete this post' });
+    }
+    
+    await Post.findByIdAndDelete(req.params.postId);
+    
+    // Remove post from user's posts array
+    await User.findByIdAndUpdate(userId, {
+      $pull: { posts: req.params.postId }
+    });
+    
+    res.json({ success: true, message: 'Post deleted successfully' });
+  } catch (error) {
+    res.status(500).json({ success: false, message: error.message });
+  }
+});
+
+// ============= 404 HANDLER =============
 app.use((req, res) => {
   res.status(404).json({ 
     success: false, 
@@ -293,7 +681,7 @@ app.use((req, res) => {
   });
 });
 
-// Error handling middleware
+// ============= ERROR HANDLING MIDDLEWARE =============
 app.use((err, req, res, next) => {
   console.error('Error:', err.stack);
   res.status(500).json({ 
@@ -302,7 +690,8 @@ app.use((err, req, res, next) => {
     error: process.env.NODE_ENV === 'development' ? err.message : undefined
   });
 });
-// Start server
+
+// ============= START SERVER =============
 const PORT = process.env.PORT || 5000;
 app.listen(PORT, () => {
   console.log(`\n🚀 Server running on http://localhost:${PORT}`);
@@ -310,5 +699,10 @@ app.listen(PORT, () => {
   console.log(`💚 Health check: http://localhost:${PORT}/api/health`);
   console.log(`📝 Register: POST http://localhost:${PORT}/api/auth/register`);
   console.log(`🔐 Login: POST http://localhost:${PORT}/api/auth/login`);
-  console.log(`👥 Get users: GET http://localhost:${PORT}/api/auth/users\n`);
+  console.log(`👥 Get users: GET http://localhost:${PORT}/api/auth/users`);
+  console.log(`🔗 Connections: POST http://localhost:${PORT}/api/connections/request/:userId`);
+  console.log(`📋 My Networks: GET http://localhost:${PORT}/api/connections`);
+  console.log(`📝 Create Post: POST http://localhost:${PORT}/api/posts`);
+  console.log(`📰 Feed Posts: GET http://localhost:${PORT}/api/posts/feed`);
+  console.log(`👤 My Posts: GET http://localhost:${PORT}/api/posts/my\n`);
 });
